@@ -1,0 +1,39 @@
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Telegram Session
+data/session.session
+data/session.session-journal
+
+# Database
+data/*.db
+data/*.db-journal
+
+# Config
+data/config.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Old directory
+old/
+
+# Data directory (sessions, databases, configs)
+data/
+
