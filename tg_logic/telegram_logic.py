@@ -140,6 +140,44 @@ class TelegramManager:
         self.loop = asyncio.new_event_loop()
         # Создаем клиент с этим event loop
         self.client = TelegramClient(SESSION_PATH, self.api_id, self.api_hash, loop=self.loop)
+
+    def get_current_user_name(self) -> Optional[str]:
+        """
+        Возвращает отображаемое имя текущего аккаунта Telegram.
+        Пытается вернуть сначала полное имя, затем username, затем телефон.
+        """
+        try:
+            asyncio.set_event_loop(self.loop)
+
+            async def _get_me():
+                return await self.client.get_me()
+
+            me = self.loop.run_until_complete(_get_me())
+            if not me:
+                return None
+
+            # Собираем человеко-понятное имя
+            parts = []
+            if getattr(me, "first_name", None):
+                parts.append(me.first_name)
+            if getattr(me, "last_name", None):
+                parts.append(me.last_name)
+            full_name = " ".join(parts).strip()
+
+            if full_name:
+                return full_name
+
+            username = getattr(me, "username", None)
+            if username:
+                return f"@{username}"
+
+            phone = getattr(me, "phone", None)
+            if phone:
+                return f"+{phone}" if not phone.startswith("+") else phone
+
+            return None
+        except Exception:
+            return None
     
     def connect(self, phone: str = None, code: str = None, password: str = None) -> Tuple[bool, str]:
         """
@@ -218,7 +256,12 @@ class TelegramManager:
         Получает список всех чатов и каналов (исключая личные чаты).
         
         Returns:
-            Список словарей с ключами 'tg_id' и 'title'
+            Список словарей с ключами:
+            - 'tg_id'             : ID сущности в Telegram
+            - 'title'             : отображаемое название
+            - 'type'              : 'channel' для каналов (broadcast),
+                                     'chat' для групп и супергрупп
+            - 'participants_count': количество участников (если доступно, иначе None)
         """
         from telethon.tl.types import User
         
@@ -251,9 +294,31 @@ class TelegramManager:
                     if not title:
                         title = getattr(entity, 'title', 'Без названия')
                     
+                    # Определяем тип сущности для отображения в таблице:
+                    # - broadcast Channel      -> "channel"
+                    # - megagroup Channel/Chat -> "chat"
+                    if isinstance(entity, Channel):
+                        # Канал-рассылка (one-way) -> "channel"
+                        if getattr(entity, "broadcast", False):
+                            chat_type = "channel"
+                        # Супергруппа (megagroup) -> "chat"
+                        elif getattr(entity, "megagroup", False):
+                            chat_type = "chat"
+                        else:
+                            # На всякий случай считаем прочие Channel как "channel"
+                            chat_type = "channel"
+                    elif isinstance(entity, Chat):
+                        # Обычная группа -> "chat"
+                        chat_type = "chat"
+
+                    # Пытаемся взять количество участников, если эта информация уже есть в сущности
+                    participants_count = getattr(entity, "participants_count", None)
+
                     chats_list.append({
                         'tg_id': entity.id,
-                        'title': title
+                        'title': title,
+                        'type': chat_type,
+                        'participants_count': participants_count
                     })
         
         except Exception as e:

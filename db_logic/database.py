@@ -26,7 +26,7 @@ def init_database():
     Инициализирует базу данных и создает необходимые таблицы, если они не существуют.
     
     Таблицы:
-    - chats: id, tg_id, title
+    - chats: id, tg_id, title, participants_count, type
     - categories: id, name (UNIQUE)
     - chat_categories: chat_tg_id, category_id (связка many-to-many)
     """
@@ -40,9 +40,30 @@ def init_database():
         CREATE TABLE IF NOT EXISTS chats (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             tg_id INTEGER UNIQUE NOT NULL,
-            title TEXT NOT NULL
+            title TEXT NOT NULL,
+            participants_count INTEGER,
+            type TEXT
         )
     ''')
+
+    # Миграции: добавляем недостающие столбцы в существующую таблицу
+    cursor.execute("PRAGMA table_info(chats)")
+    columns_info = cursor.fetchall()
+    column_names = {col[1] for col in columns_info}
+    # Столбец type
+    if "type" not in column_names:
+        try:
+            cursor.execute('ALTER TABLE chats ADD COLUMN type TEXT')
+        except sqlite3.OperationalError:
+            # Если по какой-то причине добавить столбец не удалось, продолжаем без падения
+            pass
+    # Столбец количества участников
+    if "participants_count" not in column_names:
+        try:
+            cursor.execute('ALTER TABLE chats ADD COLUMN participants_count INTEGER')
+        except sqlite3.OperationalError:
+            # Если по какой-то причине добавить столбец не удалось, продолжаем без падения
+            pass
     
     # Таблица категорий
     cursor.execute('''
@@ -89,27 +110,29 @@ def save_chats(chats: List[Dict[str, any]]):
     
     # Вставляем новые данные
     for chat in chats:
+        chat_type = chat.get('type')
+        participants_count = chat.get('participants_count')
         cursor.execute('''
-            INSERT INTO chats (tg_id, title)
-            VALUES (?, ?)
-        ''', (chat['tg_id'], chat['title']))
+            INSERT INTO chats (tg_id, title, participants_count, type)
+            VALUES (?, ?, ?, ?)
+        ''', (chat['tg_id'], chat['title'], participants_count, chat_type))
     
     conn.commit()
     conn.close()
 
 
-def get_all_chats() -> List[Tuple[int, int, str]]:
+def get_all_chats() -> List[Tuple[int, int, str, int, str]]:
     """
     Получает все чаты из базы данных, отсортированные по возрастанию tg_id.
     
     Returns:
-        Список кортежей (id, tg_id, title)
+        Список кортежей (id, tg_id, title, participants_count, type)
     """
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
     cursor.execute('''
-        SELECT id, tg_id, title
+        SELECT id, tg_id, title, participants_count, type
         FROM chats
         ORDER BY tg_id ASC
     ''')
@@ -120,13 +143,13 @@ def get_all_chats() -> List[Tuple[int, int, str]]:
     return chats
 
 
-def get_chats_for_display() -> List[Tuple[int, str, str]]:
+def get_chats_for_display() -> List[Tuple[int, str, int, str, str]]:
     """
     Получает чаты для отображения в таблице UI.
-    Возвращает tg_id, название и строку категорий через запятую.
+    Возвращает tg_id, название, количество участников, строку категорий через запятую и тип чата.
     
     Returns:
-        Список кортежей (tg_id, title, categories_string)
+        Список кортежей (tg_id, title, participants_count, categories_string, type)
     """
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -135,11 +158,13 @@ def get_chats_for_display() -> List[Tuple[int, str, str]]:
         SELECT 
             c.tg_id, 
             c.title,
-            COALESCE(GROUP_CONCAT(cat.name, ', '), '') as categories
+            COALESCE(c.participants_count, 0) as participants_count,
+            COALESCE(GROUP_CONCAT(cat.name, ', '), '') as categories,
+            c.type
         FROM chats c
         LEFT JOIN chat_categories cc ON c.tg_id = cc.chat_tg_id
         LEFT JOIN categories cat ON cc.category_id = cat.id
-        GROUP BY c.tg_id, c.title
+        GROUP BY c.tg_id, c.title, participants_count, c.type
         ORDER BY c.tg_id ASC
     ''')
     

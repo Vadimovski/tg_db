@@ -37,3 +37,6 @@ old/
 # Data directory (sessions, databases, configs)
 data/
 
+# Replace directory
+replace/
+
