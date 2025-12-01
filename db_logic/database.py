@@ -90,6 +90,34 @@ def init_database():
     except sqlite3.OperationalError:
         # Столбец не существует, игнорируем ошибку
         pass
+
+    # Таблица статистики сообщений по чатам
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS message_stats (
+            chat_tg_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL,
+            date_time TEXT NOT NULL,
+            message_text TEXT,
+            PRIMARY KEY (chat_tg_id, message_id)
+        )
+    ''')
+
+    # Миграция: добавляем недостающий столбец message_text, если таблица уже существовала
+    cursor.execute("PRAGMA table_info(message_stats)")
+    ms_columns_info = cursor.fetchall()
+    ms_column_names = {col[1] for col in ms_columns_info}
+    if "message_text" not in ms_column_names:
+        try:
+            cursor.execute('ALTER TABLE message_stats ADD COLUMN message_text TEXT')
+        except sqlite3.OperationalError:
+            # Если по какой-то причине добавить столбец не удалось, продолжаем без падения
+            pass
+
+    # Индекс для ускорения выборок по дате
+    cursor.execute('''
+        CREATE INDEX IF NOT EXISTS idx_message_stats_chat_date
+        ON message_stats (chat_tg_id, date_time)
+    ''')
     
     conn.commit()
     conn.close()
@@ -356,6 +384,157 @@ def get_available_categories_for_chat(chat_tg_id: int) -> List[Tuple[int, str]]:
     conn.close()
     
     return categories
+
+
+# ========== Функции для работы со статистикой сообщений ==========
+
+def get_last_message_id_for_chat(chat_tg_id: int) -> int:
+    """
+    Возвращает последний (максимальный) сохранённый message_id для указанного чата.
+    
+    Args:
+        chat_tg_id: ID чата по Telegram
+        
+    Returns:
+        Максимальный message_id или 0, если данных для чата нет.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        '''
+        SELECT MAX(message_id)
+        FROM message_stats
+        WHERE chat_tg_id = ?
+        ''',
+        (chat_tg_id,),
+    )
+    row = cursor.fetchone()
+    conn.close()
+
+    return int(row[0]) if row and row[0] is not None else 0
+
+
+def append_message_stats(chat_tg_id: int, messages: List[Tuple[int, str, str]]):
+    """
+    Добавляет записи в таблицу message_stats для указанного чата.
+    
+    Args:
+        chat_tg_id: ID чата по Telegram
+        messages: Список кортежей (message_id, date_time_iso, message_text)
+    """
+    if not messages:
+        return
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.executemany(
+        '''
+        INSERT OR IGNORE INTO message_stats (chat_tg_id, message_id, date_time, message_text)
+        VALUES (?, ?, ?, ?)
+        ''',
+        [(chat_tg_id, msg_id, dt, text) for (msg_id, dt, text) in messages],
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def replace_message_stats_for_chat(chat_tg_id: int, messages: List[Tuple[int, str, str]]):
+    """
+    Полностью пересобирает статистику сообщений для указанного чата.
+    
+    Args:
+        chat_tg_id: ID чата по Telegram
+        messages: Список кортежей (message_id, date_time_iso, message_text)
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute('BEGIN')
+
+        # Удаляем старые записи этого чата
+        cursor.execute(
+            '''
+            DELETE FROM message_stats
+            WHERE chat_tg_id = ?
+            ''',
+            (chat_tg_id,),
+        )
+
+        if messages:
+            cursor.executemany(
+                '''
+                INSERT INTO message_stats (chat_tg_id, message_id, date_time, message_text)
+                VALUES (?, ?, ?, ?)
+                ''',
+                [(chat_tg_id, msg_id, dt, text) for (msg_id, dt, text) in messages],
+            )
+
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def has_message_stats_for_chat(chat_tg_id: int) -> bool:
+    """
+    Проверяет, есть ли данные в таблице message_stats для указанного чата.
+    
+    Args:
+        chat_tg_id: ID чата по Telegram
+        
+    Returns:
+        True если есть хотя бы одна запись для чата, False иначе
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        '''
+        SELECT COUNT(*) FROM message_stats WHERE chat_tg_id = ?
+        ''',
+        (chat_tg_id,),
+    )
+
+    count = cursor.fetchone()[0]
+    conn.close()
+
+    return count > 0
+
+
+def get_daily_message_counts(chat_tg_id: int) -> List[Tuple[str, int]]:
+    """
+    Возвращает агрегированную статистику количества сообщений по дням для чата.
+    
+    Args:
+        chat_tg_id: ID чата по Telegram
+        
+    Returns:
+        Список кортежей (date_str 'YYYY-MM-DD', count)
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        '''
+        SELECT DATE(date_time) AS message_date, COUNT(*) AS message_count
+        FROM message_stats
+        WHERE chat_tg_id = ?
+        GROUP BY message_date
+        ORDER BY message_date
+        ''',
+        (chat_tg_id,),
+    )
+
+    rows = cursor.fetchall()
+    conn.close()
+
+    return [(str(date_str), int(count)) for (date_str, count) in rows]
 
 
 def search_available_categories_for_chat(chat_tg_id: int, search_term: str) -> List[Tuple[int, str]]:

@@ -5,8 +5,10 @@
 import os
 import json
 import asyncio
+import datetime
+from pathlib import Path
 from telethon import TelegramClient
-from telethon.tl.types import Channel, Chat
+from telethon.tl.types import Channel, Chat, Message, PeerChannel, PeerChat
 from telethon.errors import SessionPasswordNeededError
 from typing import List, Dict, Optional, Tuple
 
@@ -325,6 +327,292 @@ class TelegramManager:
             print(f'Ошибка при получении списка чатов: {e}')
         
         return chats_list
+
+    def export_chat_history_md(
+        self,
+        chat_id: int,
+        chat_title: str,
+        base_export_dir: str,
+        chat_type: Optional[str] = None,
+        words_per_file: int = 50000,
+        delay_messages_chunk: int = 1000,
+        delay_seconds: float = 1.0,
+    ) -> Dict[str, any]:
+        """
+        Экспортирует историю чата в markdown-файлы с разбиением по words_per_file слов.
+
+        Прогресс экспорта сохраняется в файле export_index.json внутри папки конкретного чата,
+        чтобы при повторном запуске дописывать только новые сообщения.
+
+        Формат файла:
+        - Заголовок с названием чата
+        - Для каждого сообщения:
+            ### YYYY-MM-DD HH:MM:SS — Автор
+            [id: MESSAGE_ID]
+
+            Текст сообщения
+
+            ---
+        """
+        import re
+
+        # Устанавливаем event loop
+        asyncio.set_event_loop(self.loop)
+
+        def safe_chat_folder_name(title: str) -> str:
+            """Безопасное имя папки/файла для чата."""
+            title = title or "chat"
+            # Убираем переводы строк и лишние пробелы
+            title = " ".join(title.split())
+            # Заменяем запрещённые в имени файла символы
+            title = re.sub(r'[\\/:*?"<>|]', "_", title)
+            # Ограничиваем длину, чтобы не упираться в лимиты файловой системы
+            return title[:80] if len(title) > 80 else title
+
+        # Базовая директория экспорта и директория конкретного чата
+        base_path = Path(base_export_dir)
+        chat_folder_name = f"{safe_chat_folder_name(chat_title)}_{chat_id}"
+        chat_dir = base_path / chat_folder_name
+        chat_dir.mkdir(parents=True, exist_ok=True)
+
+        index_path = chat_dir / "export_index.json"
+
+        # Инициализация прогресса
+        last_message_id: Optional[int] = None
+        file_index: int = 1
+        current_words: int = 0
+
+        if index_path.exists():
+            try:
+                with index_path.open("r", encoding="utf-8") as f:
+                    idx = json.load(f)
+                last_message_id = idx.get("last_message_id")
+                file_index = int(idx.get("last_file_index", 1))
+                current_words = int(idx.get("current_file_word_count", 0))
+            except Exception:
+                # Если индекс повреждён, начинаем с нуля
+                last_message_id = None
+                file_index = 1
+                current_words = 0
+
+        def make_file_path(i: int) -> Path:
+            filename = f"{safe_chat_folder_name(chat_title)}_chatexport_{i:02d}.md"
+            return chat_dir / filename
+
+        file_path = make_file_path(file_index)
+        file_exists = file_path.exists()
+        file = file_path.open("a", encoding="utf-8")
+
+        # Если файл новый/пустой, пишем заголовок с названием чата
+        if not file_exists or file_path.stat().st_size == 0:
+            file.write(f"# {chat_title}\n\n")
+
+        def save_index() -> None:
+            data = {
+                "chat_id": chat_id,
+                "chat_title": chat_title,
+                "last_message_id": last_message_id,
+                "last_file_index": file_index,
+                "current_file_word_count": current_words,
+                "words_per_file": words_per_file,
+                "updated_at": datetime.datetime.utcnow().isoformat() + "Z",
+            }
+            try:
+                with index_path.open("w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+            except Exception:
+                # Ошибку записи индекса не считаем фатальной для экспорта
+                pass
+
+        async def _export() -> Dict[str, any]:
+            nonlocal last_message_id, file_index, current_words, file
+
+            # Убеждаемся, что клиент подключён и авторизован
+            if not self.client.is_connected():
+                await self.client.connect()
+            if not await self.client.is_user_authorized():
+                raise RuntimeError("Telegram client is not authorized")
+
+            # Явно резолвим сущность чата/канала, чтобы избежать ошибок
+            # вида "Could not find the input entity for PeerUser(...)"
+            peer = chat_id
+            try:
+                if chat_type == "channel":
+                    peer = PeerChannel(chat_id)
+                elif chat_type == "chat":
+                    peer = PeerChat(chat_id)
+            except Exception:
+                peer = chat_id
+
+            try:
+                entity = await self.client.get_entity(peer)
+            except Exception as e:
+                raise RuntimeError(f"Не удалось получить сущность чата {chat_id}: {e}")
+
+            # Итерируемся по сообщениям от самых старых к новым
+            messages_iter = self.client.iter_messages(
+                entity=entity,
+                reverse=True,
+                min_id=(last_message_id or 0),
+            )
+
+            messages_processed = 0
+
+            async for msg in messages_iter:
+                if not isinstance(msg, Message):
+                    continue
+
+                # Нас интересуют только текстовые сообщения
+                text = getattr(msg, "message", None)
+                if not text:
+                    continue
+
+                words = text.split()
+                msg_words = len(words)
+                if msg_words == 0:
+                    continue
+
+                # Проверяем лимит слов: если текущее сообщение не влезает,
+                # переносим его целиком в новый файл
+                if current_words > 0 and current_words + msg_words > words_per_file:
+                    file.close()
+
+                    file_index += 1
+                    current_words = 0
+
+                    new_path = make_file_path(file_index)
+                    file = new_path.open("a", encoding="utf-8")
+                    file.write(f"# {chat_title}\n\n")
+
+                # Подготовка метаданных сообщения
+                dt = msg.date.astimezone() if msg.date else None
+                dt_str = dt.strftime("%Y-%m-%d %H:%M:%S") if dt else ""
+
+                sender_name = ""
+                try:
+                    if msg.sender:
+                        first = getattr(msg.sender, "first_name", "") or ""
+                        last = getattr(msg.sender, "last_name", "") or ""
+                        username = getattr(msg.sender, "username", "") or ""
+                        if first or last:
+                            sender_name = (first + " " + last).strip()
+                        elif username:
+                            sender_name = f"@{username}"
+                except Exception:
+                    sender_name = ""
+
+                header_line = f"### {dt_str}"
+                if sender_name:
+                    header_line += f" — {sender_name}"
+
+                file.write(header_line + "\n")
+                file.write(f"[id: {msg.id}]\n\n")
+                file.write(text.strip() + "\n\n")
+                file.write("---\n\n")
+
+                current_words += msg_words
+                last_message_id = msg.id
+                messages_processed += 1
+
+                # Периодически сохраняем прогресс
+                if messages_processed % 50 == 0:
+                    save_index()
+
+                # Задержка для снижения нагрузки на Telegram
+                if (
+                    delay_messages_chunk > 0
+                    and messages_processed % delay_messages_chunk == 0
+                    and delay_seconds > 0
+                ):
+                    await asyncio.sleep(delay_seconds)
+
+            # Завершение экспорта: закрываем файл и сохраняем индекс
+            file.close()
+            save_index()
+
+            return {
+                "messages_exported": messages_processed,
+                "files_used": file_index,
+                "chat_dir": str(chat_dir),
+            }
+
+        try:
+            result = self.loop.run_until_complete(_export())
+        finally:
+            try:
+                file.close()
+            except Exception:
+                pass
+
+        return result
+
+    def get_chat_messages_for_stats(
+        self,
+        chat_id: int,
+        chat_type: Optional[str] = None,
+        min_message_id: int = 0,
+    ) -> List[Dict[str, any]]:
+        """
+        Возвращает список сообщений для построения статистики.
+
+        Сообщения выбираются от самого старого к новому, начиная с message_id > min_message_id.
+        Для каждого сообщения возвращаются:
+        - message_id: ID сообщения
+        - date_time: время сообщения в ISO-формате (локальное время)
+        - text: текст сообщения (может быть пустой строкой)
+        """
+        from telethon.tl.types import PeerChannel, PeerChat
+
+        asyncio.set_event_loop(self.loop)
+
+        async def _collect() -> List[Dict[str, any]]:
+            result: List[Dict[str, any]] = []
+
+            # Убеждаемся, что клиент подключён и авторизован
+            if not self.client.is_connected():
+                await self.client.connect()
+            if not await self.client.is_user_authorized():
+                raise RuntimeError("Telegram client is not authorized")
+
+            # Определяем peer для чата
+            peer = chat_id
+            try:
+                if chat_type == "channel":
+                    peer = PeerChannel(chat_id)
+                elif chat_type == "chat":
+                    peer = PeerChat(chat_id)
+            except Exception:
+                peer = chat_id
+
+            try:
+                entity = await self.client.get_entity(peer)
+            except Exception as e:
+                raise RuntimeError(f"Не удалось получить сущность чата {chat_id}: {e}")
+
+            messages_iter = self.client.iter_messages(
+                entity=entity,
+                reverse=True,
+                min_id=max(0, int(min_message_id)),
+            )
+
+            async for msg in messages_iter:
+                if not isinstance(msg, Message):
+                    continue
+                dt = msg.date.astimezone() if msg.date else None
+                dt_iso = dt.isoformat() if dt else ""
+                text = getattr(msg, "message", "") or ""
+                result.append(
+                    {
+                        "message_id": int(msg.id),
+                        "date_time": dt_iso,
+                        "text": text,
+                    }
+                )
+
+            return result
+
+        msgs = self.loop.run_until_complete(_collect())
+        return msgs
     
     def disconnect(self):
         """Отключается от Telegram."""

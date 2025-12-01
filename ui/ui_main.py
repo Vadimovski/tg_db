@@ -3,22 +3,38 @@
 Создает GUI на основе customtkinter для отображения чатов Telegram.
 """
 import customtkinter as ctk
-from tkinter import ttk, messagebox, PhotoImage, Menu
+from tkinter import ttk, messagebox, PhotoImage, Menu, filedialog
 import threading
 import os
 import sys
 import sqlite3
 import json
+from datetime import datetime
+
+import pyqtgraph as pg
+from pyqtgraph.Qt import QtGui, QtWidgets, QtCore
 
 # Добавляем корневую директорию проекта в путь
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, BASE_DIR)
 
+# Пути к конфигам
+GRAPH_SETTINGS_FILE = os.path.join(BASE_DIR, "data", "graph_settings.json")
+
 from tg_logic import TelegramManager, save_api_credentials, load_api_credentials
 from db_logic import (
-    init_database, save_chats, get_chats_for_display,
-    create_category, get_available_categories_for_chat, search_available_categories_for_chat,
-    add_category_to_chat
+    init_database,
+    save_chats,
+    get_chats_for_display,
+    create_category,
+    get_available_categories_for_chat,
+    search_available_categories_for_chat,
+    add_category_to_chat,
+    get_last_message_id_for_chat,
+    append_message_stats,
+    replace_message_stats_for_chat,
+    has_message_stats_for_chat,
+    get_daily_message_counts,
 )
 
 
@@ -36,6 +52,9 @@ class TelegramChatsApp(ctk.CTk):
         # Настройка окна
         self.title("Telegram Chats Manager")
         self.geometry("900x600")
+        # Настраиваем окно для корректного изменения размеров
+        self.grid_rowconfigure(0, weight=1)
+        self.grid_columnconfigure(0, weight=1)
         
         # Инициализация базы данных
         init_database()
@@ -74,6 +93,10 @@ class TelegramChatsApp(ctk.CTk):
         self.table_settings = self.load_table_settings()
         # Загружаем настройки поиска
         self.search_settings = self.load_search_settings()
+        # Загружаем настройки экспорта
+        self.export_settings = self.load_export_settings()
+        # Загружаем настройки графика сообщений
+        self.chart_settings = self.load_chart_settings()
         # Загрузка иконок типов (канал / чат)
         self._load_type_icons()
         
@@ -88,6 +111,24 @@ class TelegramChatsApp(ctk.CTk):
         
         # Загрузка данных при запуске, если они есть в БД
         self.refresh_table()
+        
+        # Максимизируем окно после полной инициализации (как в окне графика)
+        # Используем протокол для максимизации после первого отображения окна
+        def maximize_window():
+            """Максимизирует окно после его отображения."""
+            try:
+                self.update_idletasks()  # Обновляем информацию о размерах окна
+                # Максимизируем окно (аналогично showMaximized() в окне графика)
+                self.state('zoomed')  # Для Windows максимизирует окно в полноэкранном режиме
+                self.update_idletasks()  # Обновляем после максимизации
+            except Exception as e:
+                print(f"Ошибка при максимизации окна: {e}")
+        
+        # Выполняем максимизацию после того, как окно отобразится
+        # Используем несколько попыток с задержками, как в окне графика
+        self.after(0, maximize_window)
+        self.after(50, maximize_window)  # Дополнительная попытка через 50мс
+        self.after(200, maximize_window)  # Дополнительная попытка через 200мс
     
     def _load_type_icons(self):
         """Загружает иконки для столбца 'Тип' и хранит ссылки, чтобы их не собирал GC."""
@@ -166,7 +207,17 @@ class TelegramChatsApp(ctk.CTk):
                 "heading": "+",
                 "width": 50,
                 "anchor": "center"
-            }
+            },
+            "Экспорт чата": {
+                "heading": "Экспорт",
+                "width": 80,
+                "anchor": "center"
+            },
+            "График сообщений": {
+                "heading": "График",
+                "width": 100,
+                "anchor": "center"
+            },
         }
         
         if os.path.exists(config_file):
@@ -254,6 +305,70 @@ class TelegramChatsApp(ctk.CTk):
                 return default_settings
 
         return default_settings
+
+    def load_export_settings(self):
+        """
+        Загружает настройки экспорта чатов из config.json.
+        """
+        config_file = os.path.join(BASE_DIR, 'data', 'config.json')
+
+        default_settings = {
+            "words_per_file": 50000,
+            "delay_messages_chunk": 1000,
+            "delay_seconds": 1.0,
+        }
+
+        if os.path.exists(config_file):
+            try:
+                with open(config_file, 'r', encoding='utf-8') as f:
+                    config = json.load(f)
+                    export_settings = config.get("export_settings", {}) or {}
+                    result = default_settings.copy()
+                    result.update(export_settings)
+                    return result
+            except (json.JSONDecodeError, IOError, KeyError):
+                return default_settings
+
+        return default_settings
+
+    def load_chart_settings(self):
+        """
+        Загружает настройки графика сообщений из data/graph_settings.json.
+        Если файл отсутствует или повреждён, используются значения по умолчанию.
+        """
+        default_settings = {
+            "bar_color": "#1f77b4",
+            "bargap": 0.15,
+            "xaxis_tickangle": -45,
+            "auto_open": True,
+        }
+
+        if os.path.exists(GRAPH_SETTINGS_FILE):
+            try:
+                with open(GRAPH_SETTINGS_FILE, "r", encoding="utf-8") as f:
+                    config = json.load(f) or {}
+
+                result = default_settings.copy()
+                result.update(config)
+                return result
+            except (json.JSONDecodeError, IOError, TypeError):
+                # Если файл настроек битый, тихо откатываемся к дефолтам
+                return default_settings
+
+        return default_settings
+
+    def _format_number(self, value):
+        """
+        Красиво форматирует число с разделением тысяч пробелами: 1 000, 23 456 789.
+        Нечисловые значения возвращаются как есть.
+        """
+        if value is None:
+            return ""
+        try:
+            n = int(str(value).replace(" ", ""))
+        except (TypeError, ValueError):
+            return str(value)
+        return f"{n:,}".replace(",", " ")
     
     def create_menu(self):
         """Создает верхнее меню приложения (в тёмной теме) с действиями подключения и обновления."""
@@ -419,9 +534,6 @@ class TelegramChatsApp(ctk.CTk):
         """
         if not hasattr(self, "tree"):
             return
-
-        # Убедимся, что состояние видимости синхронизировано с конфигом
-        self._init_column_visibility_state()
 
         column_order = list(self.column_config.keys())
         type_column_name = "Тип"
@@ -727,6 +839,8 @@ class TelegramChatsApp(ctk.CTk):
         
         # Привязка события клика по таблице (для обработки столбцов действий)
         self.tree.bind("<Button-1>", self._on_tree_click)
+        # Привязка события двойного клика по строке для копирования значений
+        self.tree.bind("<Double-1>", self._on_tree_double_click)
 
         # После создания таблицы применяем актуальное состояние видимости столбцов
         self._apply_column_visibility()
@@ -853,6 +967,7 @@ class TelegramChatsApp(ctk.CTk):
                     elif chat_type == "chat" and self.chat_icon is not None:
                         row_icon = self.chat_icon
                 elif col_name == "ID чата по ТГ":
+                    # ID чата отображаем без разделения тысяч, как есть
                     row_values.append((str(tg_id), 1))
                 elif col_name == "Название":
                     # Получаем ширину столбца
@@ -862,7 +977,7 @@ class TelegramChatsApp(ctk.CTk):
                     row_max_lines = max(row_max_lines, num_lines)
                 elif col_name == "Количество участников":
                     # Количество участников отображаем как число по центру
-                    value = "" if participants_count is None else str(participants_count)
+                    value = self._format_number(participants_count)
                     row_values.append((value, 1))
                 elif col_name == "Категории":
                     # Получаем ширину столбца
@@ -875,6 +990,12 @@ class TelegramChatsApp(ctk.CTk):
                     row_values.append(("✎", 1))
                 elif col_name == "Добавление категорий чату":
                     row_values.append(("+", 1))
+                elif col_name == "Экспорт чата":
+                    # Столбец с кнопкой экспорта чата
+                    row_values.append(("⭳", 1))
+                elif col_name == "График сообщений":
+                    # Столбец с кнопкой графика сообщений
+                    row_values.append(("📈", 1))
                 else:
                     row_values.append(("", 1))
             
@@ -901,7 +1022,9 @@ class TelegramChatsApp(ctk.CTk):
                 item_id = self.tree.insert("", "end", values=values_tuple)
         
         # Обновление статуса
-        self.status_label.configure(text=f"Загружено чатов: {len(chats)}")
+        self.status_label.configure(
+            text=f"Загружено чатов: {self._format_number(len(chats))}"
+        )
     
     def on_refresh_clicked(self):
         """
@@ -1017,7 +1140,7 @@ class TelegramChatsApp(ctk.CTk):
             # Обновляем таблицу в главном потоке
             self.after(0, self.refresh_table)
             self.after(0, lambda: self.status_label.configure(
-                text=f"Обновлено! Загружено чатов: {len(chats)}"
+                text=f"Обновлено! Загружено чатов: {self._format_number(len(chats))}"
             ))
             
         except Exception as e:
@@ -1527,6 +1650,18 @@ class TelegramChatsApp(ctk.CTk):
                 edit_display_index = display_columns.index("Редактирование категорий чата") + 1
             except ValueError:
                 edit_display_index = None
+
+            try:
+                # Находим индекс столбца экспорта чата (если он есть) в display_columns
+                export_display_index = display_columns.index("Экспорт чата") + 1
+            except ValueError:
+                export_display_index = None
+
+            try:
+                # Находим индекс столбца графика сообщений (если он есть) в display_columns
+                graph_display_index = display_columns.index("График сообщений") + 1
+            except ValueError:
+                graph_display_index = None
             
             if not item:
                 return
@@ -1542,7 +1677,9 @@ class TelegramChatsApp(ctk.CTk):
             tg_id = None
             if tg_id_col_index is not None and values and len(values) > tg_id_col_index:
                 try:
-                    tg_id = int(values[tg_id_col_index])
+                    # Удаляем пробелы-разделители тысяч перед преобразованием в число
+                    raw_id = str(values[tg_id_col_index]).replace(" ", "")
+                    tg_id = int(raw_id)
                 except (ValueError, IndexError):
                     tg_id = None
             
@@ -1555,6 +1692,91 @@ class TelegramChatsApp(ctk.CTk):
             if edit_display_index is not None and column == f"#{edit_display_index}" and tg_id is not None:
                 self._show_edit_categories_dialog(tg_id)
                 return
+
+            # Обработка клика по столбцу экспорта чата
+            if export_display_index is not None and column == f"#{export_display_index}" and tg_id is not None:
+                chat_info = self._get_chat_by_id(tg_id)
+                if chat_info:
+                    chat_title, participants_count, categories, chat_type = chat_info
+                    self._show_export_dialog(tg_id, chat_title, chat_type)
+                return
+
+            # Обработка клика по столбцу "График сообщений"
+            if graph_display_index is not None and column == f"#{graph_display_index}" and tg_id is not None:
+                chat_info = self._get_chat_by_id(tg_id)
+                if chat_info:
+                    chat_title, participants_count, categories, chat_type = chat_info
+                    self._show_message_stats_chart(tg_id, chat_title, chat_type)
+                return
+
+    def _on_tree_double_click(self, event):
+        """
+        Копирует значение из строки по двойному клику:
+        - если клик по колонке ID чата — копируется ID;
+        - если клик по колонке Название — копируется название.
+        """
+        region = self.tree.identify_region(event.x, event.y)
+        if region != "cell":
+            return
+
+        column = self.tree.identify_column(event.x)
+        item = self.tree.identify_row(event.y)
+        if not item or not column.startswith("#"):
+            return
+
+        # Восстанавливаем порядок столбцов из конфига
+        column_order = list(self.column_config.keys())
+        type_column_name = "Тип"
+        display_columns = [name for name in column_order if name != type_column_name]
+
+        # Индексы интересующих нас колонок
+        try:
+            id_display_index = display_columns.index("ID чата по ТГ")
+        except ValueError:
+            id_display_index = None
+
+        try:
+            title_display_index = display_columns.index("Название")
+        except ValueError:
+            title_display_index = None
+
+        # Преобразуем "#N" -> индекс 0-based в display_columns
+        try:
+            clicked_index = int(column[1:]) - 1
+        except ValueError:
+            return
+
+        # Нас интересуют только колонки ID и Название
+        if clicked_index not in (id_display_index, title_display_index):
+            return
+
+        values = self.tree.item(item, "values") or ()
+        if clicked_index < 0 or clicked_index >= len(values):
+            return
+
+        value_to_copy = values[clicked_index]
+        if not value_to_copy:
+            return
+
+        # Копируем в буфер обмена
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(str(value_to_copy))
+            # Обновляем UI, чтобы буфер гарантированно применился
+            self.update()
+
+            # Готовим текст статуса
+            status_text = "Скопировано в буфер обмена"
+            if clicked_index == id_display_index:
+                status_text = "ID чата скопирован в буфер обмена"
+            elif clicked_index == title_display_index:
+                status_text = "Название чата скопировано в буфер обмена"
+
+            if hasattr(self, "status_label"):
+                self.status_label.configure(text=status_text)
+        except Exception as e:
+            if hasattr(self, "status_label"):
+                self.status_label.configure(text=f"Не удалось скопировать: {e}")
     
     def _show_category_dialog(self, chat_tg_id):
         """Показывает мини-окошко для управления категориями чата."""
@@ -1775,7 +1997,114 @@ class TelegramChatsApp(ctk.CTk):
             self.refresh_table()
         except Exception as e:
             messagebox.showerror("Ошибка", f"Не удалось удалить категорию: {str(e)}")
-    
+
+    def _get_chat_by_id(self, tg_id: int):
+        """
+        Возвращает информацию о чате по Telegram ID из кэша self.all_chats.
+        Формат: (title, participants_count, categories, chat_type) или None.
+        """
+        if not getattr(self, "all_chats", None):
+            return None
+        for chat_tg_id, title, participants_count, categories, chat_type in self.all_chats:
+            if chat_tg_id == tg_id:
+                return (title, participants_count, categories, chat_type)
+        return None
+
+    def _show_export_dialog(self, chat_tg_id: int, chat_title: str, chat_type: str):
+        """
+        Показывает мини-окошко выбора папки и запуска экспорта чата.
+        """
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Экспорт чата")
+        dialog.geometry("500x220")
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+
+        # Центрируем окно
+        dialog.update_idletasks()
+        x = (dialog.winfo_screenwidth() // 2) - (dialog.winfo_width() // 2)
+        y = (dialog.winfo_screenheight() // 2) - (dialog.winfo_height() // 2)
+        dialog.geometry(f"+{x}+{y}")
+
+        main_container = ctk.CTkFrame(dialog)
+        main_container.pack(fill="both", expand=True, padx=20, pady=20)
+
+        title_label = ctk.CTkLabel(
+            main_container,
+            text=f"Экспорт чата:\n{chat_title}",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            justify="center",
+        )
+        title_label.pack(pady=(0, 15))
+
+        # Выбор папки
+        path_var = ctk.StringVar(value="Не выбрана")
+
+        path_frame = ctk.CTkFrame(main_container)
+        path_frame.pack(fill="x", pady=(0, 10))
+
+        path_entry = ctk.CTkEntry(
+            path_frame,
+            textvariable=path_var,
+            state="disabled",
+            width=320,
+        )
+        path_entry.pack(side="left", padx=(0, 10), fill="x", expand=True)
+
+        def choose_dir():
+            dirname = filedialog.askdirectory()
+            if dirname:
+                path_var.set(dirname)
+
+        choose_button = ctk.CTkButton(
+            path_frame,
+            text="Выбрать папку",
+            command=choose_dir,
+            width=120,
+        )
+        choose_button.pack(side="left")
+
+        # Кнопки управления
+        button_frame = ctk.CTkFrame(main_container)
+        button_frame.pack(fill="x", pady=(15, 0))
+
+        def on_start():
+            export_dir = path_var.get().strip()
+            if not export_dir or export_dir == "Не выбрана":
+                messagebox.showerror("Ошибка", "Выберите папку для экспорта")
+                return
+
+            dialog.destroy()
+
+            # Запускаем экспорт в отдельном потоке
+            thread = threading.Thread(
+                target=self._export_chat_thread,
+                args=(chat_tg_id, chat_title, chat_type, export_dir),
+            )
+            thread.daemon = True
+            thread.start()
+
+        start_button = ctk.CTkButton(
+            button_frame,
+            text="Начать экспорт",
+            command=on_start,
+            width=160,
+            fg_color="#0066cc",
+            hover_color="#0052a3",
+        )
+        start_button.pack(side="left", padx=5)
+
+        cancel_button = ctk.CTkButton(
+            button_frame,
+            text="Отмена",
+            command=dialog.destroy,
+            width=120,
+            fg_color="gray",
+            hover_color="darkgray",
+        )
+        cancel_button.pack(side="left", padx=5)
+
     def _create_category_dialog(self, chat_tg_id, parent_dialog, update_callback):
         """Создает диалог для создания новой категории."""
         dialog = ctk.CTkToplevel(parent_dialog)
@@ -1863,7 +2192,513 @@ class TelegramChatsApp(ctk.CTk):
             self.refresh_table()
         except Exception as e:
             messagebox.showerror("Ошибка", f"Не удалось присвоить категорию: {str(e)}")
+    
+    def _export_chat_thread(self, chat_tg_id: int, chat_title: str, chat_type: str, export_dir: str):
+        """
+        Выполняет экспорт чата в отдельном потоке, чтобы не блокировать UI.
+        """
+        try:
+            # Проверяем наличие API credentials
+            if not self.api_id or not self.api_hash:
+                self.after(0, lambda: messagebox.showwarning(
+                    "Предупреждение",
+                    "Сначала подключитесь через кнопку 'Подключиться'"
+                ))
+                return
 
+            # Инициализируем/используем существующий TelegramManager
+            if not self.telegram_manager:
+                manager = TelegramManager(self.api_id, self.api_hash)
+                self.telegram_manager = manager
+            else:
+                manager = self.telegram_manager
+
+            # Подключаемся при необходимости
+            self.after(0, lambda: self.status_label.configure(
+                text=f"Подключение к Telegram для экспорта чата '{chat_title}'..."
+            ))
+            success, message = manager.connect()
+            if not success and message in ["phone", "code", "password"]:
+                self.after(0, lambda: messagebox.showwarning(
+                    "Требуется авторизация",
+                    "Сначала подключитесь через кнопку 'Подключиться'"
+                ))
+                return
+            elif not success:
+                self.after(0, lambda: self.status_label.configure(
+                    text=f"Ошибка подключения: {message}"
+                ))
+                self.after(0, lambda: messagebox.showerror(
+                    "Ошибка подключения",
+                    message
+                ))
+                return
+
+            self.after(0, lambda: self.status_label.configure(
+                text=f"Экспорт чата '{chat_title}'..."
+            ))
+
+            settings = getattr(self, "export_settings", None) or self.load_export_settings()
+
+            result = manager.export_chat_history_md(
+                chat_id=chat_tg_id,
+                chat_title=chat_title,
+                base_export_dir=export_dir,
+                chat_type=chat_type,
+                words_per_file=settings.get("words_per_file", 50000),
+                delay_messages_chunk=settings.get("delay_messages_chunk", 1000),
+                delay_seconds=settings.get("delay_seconds", 1.0),
+            )
+
+            def on_success():
+                msgs = result.get("messages_exported", 0)
+                files_used = result.get("files_used", 0)
+                chat_dir = result.get("chat_dir", export_dir)
+                self.status_label.configure(
+                    text=(
+                        f"Экспорт завершён: сообщений {self._format_number(msgs)}, "
+                        f"файлов {self._format_number(files_used)}"
+                    )
+                )
+                messagebox.showinfo(
+                    "Экспорт завершён",
+                    f"Экспорт чата '{chat_title}' завершён.\n"
+                    f"Сообщений: {self._format_number(msgs)}\n"
+                    f"Файлов: {self._format_number(files_used)}\n"
+                    f"Папка: {chat_dir}"
+                )
+
+            self.after(0, on_success)
+
+        except Exception as e:
+            err = str(e)
+
+            def on_error():
+                self.status_label.configure(text=f"Ошибка экспорта: {err}")
+                messagebox.showerror("Ошибка экспорта", err)
+
+            self.after(0, on_error)
+
+    def _show_message_stats_chart(self, chat_tg_id: int, chat_title: str, chat_type: str):
+        """
+        Показывает диалог с выбором действия: построить график или обновить данные.
+        """
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("График сообщений")
+        dialog.geometry("400x250")
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+
+        # Центрируем окно
+        dialog.update_idletasks()
+        x = (dialog.winfo_screenwidth() // 2) - (dialog.winfo_width() // 2)
+        y = (dialog.winfo_screenheight() // 2) - (dialog.winfo_height() // 2)
+        dialog.geometry(f"+{x}+{y}")
+
+        main_container = ctk.CTkFrame(dialog)
+        main_container.pack(fill="both", expand=True, padx=20, pady=20)
+
+        title_label = ctk.CTkLabel(
+            main_container,
+            text=f"График сообщений:\n{chat_title}",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            justify="center",
+        )
+        title_label.pack(pady=(0, 10))
+
+        # Label для статуса прогресса
+        status_label = ctk.CTkLabel(
+            main_container,
+            text="",
+            font=ctk.CTkFont(size=12),
+            justify="center",
+            text_color="gray",
+        )
+        status_label.pack(pady=(0, 15))
+
+        button_frame = ctk.CTkFrame(main_container)
+        button_frame.pack(fill="x", pady=(0, 10))
+
+        def on_build_chart():
+            # Проверяем наличие данных, если нет - сначала обновляем
+            if not has_message_stats_for_chat(chat_tg_id):
+                # Нет данных - сначала обновляем, потом строим график
+                # Отключаем кнопки во время обновления
+                build_button.configure(state="disabled")
+                update_button.configure(state="disabled")
+                self._update_message_stats_and_build_chart(chat_tg_id, chat_title, chat_type, dialog, status_label)
+            else:
+                # Данные есть - просто строим график и закрываем диалог
+                dialog.destroy()
+                self._build_chart_from_existing_data(chat_tg_id, chat_title)
+
+        def on_update_data():
+            # Отключаем кнопки во время обновления
+            build_button.configure(state="disabled")
+            update_button.configure(state="disabled")
+            self._update_message_stats_only(chat_tg_id, chat_title, chat_type, dialog, status_label)
+
+        build_button = ctk.CTkButton(
+            button_frame,
+            text="Построить график",
+            command=on_build_chart,
+            width=160,
+            fg_color="#0066cc",
+            hover_color="#0052a3",
+        )
+        build_button.pack(side="left", padx=5, expand=True)
+
+        update_button = ctk.CTkButton(
+            button_frame,
+            text="Обновить данные",
+            command=on_update_data,
+            width=160,
+            fg_color="#0066cc",
+            hover_color="#0052a3",
+        )
+        update_button.pack(side="left", padx=5, expand=True)
+
+        # Сохраняем ссылки на кнопки для последующего включения
+        dialog.build_button = build_button
+        dialog.update_button = update_button
+
+    def _update_message_stats_only(self, chat_tg_id: int, chat_title: str, chat_type: str, dialog, status_label):
+        """
+        Обновляет данные в таблице message_stats для чата (без построения графика).
+        """
+        thread = threading.Thread(
+            target=self._update_message_stats_thread,
+            args=(chat_tg_id, chat_title, chat_type, dialog, status_label, False),
+        )
+        thread.daemon = True
+        thread.start()
+
+    def _update_message_stats_and_build_chart(self, chat_tg_id: int, chat_title: str, chat_type: str, dialog, status_label):
+        """
+        Обновляет данные в таблице message_stats и строит график.
+        """
+        thread = threading.Thread(
+            target=self._update_message_stats_thread,
+            args=(chat_tg_id, chat_title, chat_type, dialog, status_label, True),
+        )
+        thread.daemon = True
+        thread.start()
+
+    def _update_message_stats_thread(
+        self,
+        chat_tg_id: int,
+        chat_title: str,
+        chat_type: str,
+        dialog,
+        status_label,
+        build_chart_after: bool,
+    ):
+        """
+        Фоновая логика: обновляет таблицу message_stats для чата.
+        Если build_chart_after=True, после обновления строит график.
+        """
+        try:
+            def update_status(text: str):
+                """Обновляет текст статуса в диалоге."""
+                self.after(0, lambda: status_label.configure(text=text))
+
+            def enable_buttons():
+                """Включает кнопки обратно."""
+                self.after(0, lambda: dialog.build_button.configure(state="normal"))
+                self.after(0, lambda: dialog.update_button.configure(state="normal"))
+
+            # Проверяем наличие API credentials
+            if not self.api_id or not self.api_hash:
+                enable_buttons()
+                self.after(
+                    0,
+                    lambda: messagebox.showwarning(
+                        "Предупреждение",
+                        "Сначала подключитесь через кнопку 'Подключиться'",
+                    ),
+                )
+                return
+
+            # Инициализируем/используем существующий TelegramManager
+            if not self.telegram_manager:
+                manager = TelegramManager(self.api_id, self.api_hash)
+                self.telegram_manager = manager
+            else:
+                manager = self.telegram_manager
+
+            # Подключаемся при необходимости
+            update_status("Подключение к Telegram...")
+            self.after(0, lambda: self.status_label.configure(
+                text=f"Подключение к Telegram для получения статистики чата '{chat_title}'..."
+            ))
+            success, message = manager.connect()
+            if not success and message in ["phone", "code", "password"]:
+                enable_buttons()
+                update_status("")
+                self.after(
+                    0,
+                    lambda: messagebox.showwarning(
+                        "Требуется авторизация",
+                        "Сначала подключитесь через кнопку 'Подключиться'",
+                    ),
+                )
+                return
+            elif not success:
+                enable_buttons()
+                update_status(f"Ошибка подключения: {message}")
+                self.after(
+                    0,
+                    lambda: messagebox.showerror(
+                        "Ошибка подключения",
+                        message,
+                    ),
+                )
+                return
+
+            # Забираем все сообщения с самого начала истории
+            update_status("Пожалуйста, подождите.\nДанные загружаются...")
+            from tg_logic import TelegramManager as _TM
+            try:
+                all_messages = manager.get_chat_messages_for_stats(
+                    chat_id=chat_tg_id,
+                    chat_type=chat_type,
+                    min_message_id=0,  # все сообщения
+                )
+            except Exception as e:
+                err = str(e)
+                enable_buttons()
+                update_status(f"Ошибка получения сообщений: {err}")
+                self.after(
+                    0,
+                    lambda: messagebox.showerror(
+                        "Ошибка получения сообщений",
+                        err,
+                    ),
+                )
+                return
+
+            # Полностью пересобираем таблицу message_stats для этого чата
+            update_status("Сохранение данных в таблицу...")
+            to_store = [
+                (msg["message_id"], msg["date_time"], msg.get("text", ""))
+                for msg in all_messages
+            ]
+            replace_message_stats_for_chat(chat_tg_id, to_store)
+
+            # Получаем агрегированную статистику по дням
+            daily_counts = get_daily_message_counts(chat_tg_id)
+
+            # Уведомление о завершении обновления
+            def show_loaded_info():
+                total_msgs = len(to_store)
+                total_days = len(daily_counts)
+                status_text = (
+                    f"Данные обновлены: "
+                    f"сообщений {self._format_number(total_msgs)}, "
+                    f"дней {self._format_number(total_days)}"
+                )
+                status_label.configure(text=status_text)
+                self.status_label.configure(
+                    text=(
+                        f"Статистика сообщений обновлена: "
+                        f"сообщений {self._format_number(total_msgs)}, "
+                        f"дней в выборке {self._format_number(total_days)}"
+                    )
+                )
+                enable_buttons()
+
+            self.after(0, show_loaded_info)
+
+            # Если нужно построить график - строим и закрываем диалог
+            if build_chart_after:
+                self.after(
+                    0,
+                    lambda: dialog.destroy()
+                )
+                self.after(
+                    0,
+                    lambda: self._open_message_stats_chart_window(
+                        chat_tg_id,
+                        chat_title,
+                        daily_counts,
+                    ),
+                )
+
+        except Exception as e:
+            err = str(e)
+
+            def on_error():
+                enable_buttons()
+                status_label.configure(text=f"Ошибка: {err}")
+                self.status_label.configure(text=f"Ошибка обновления данных: {err}")
+                messagebox.showerror("Ошибка обновления данных", err)
+
+            self.after(0, on_error)
+
+    def _build_chart_from_existing_data(self, chat_tg_id: int, chat_title: str):
+        """
+        Строит график из существующих данных в таблице message_stats.
+        """
+        try:
+            daily_counts = get_daily_message_counts(chat_tg_id)
+            if not daily_counts:
+                messagebox.showinfo(
+                    "Нет данных",
+                    "Для этого чата нет данных о сообщениях.\nИспользуйте кнопку 'Обновить данные' для загрузки.",
+                )
+                return
+            self._open_message_stats_chart_window(chat_tg_id, chat_title, daily_counts)
+        except Exception as e:
+            messagebox.showerror(
+                "Ошибка построения графика",
+                f"Не удалось построить график: {str(e)}",
+            )
+
+    def _open_message_stats_chart_window(
+        self,
+        chat_tg_id: int,
+        chat_title: str,
+        daily_counts,
+    ):
+        """
+        Открывает график количества сообщений по датам с помощью PyQtGraph.
+        """
+        if not daily_counts:
+            messagebox.showinfo(
+                "Нет данных",
+                "Для этого чата пока нет данных о сообщениях.",
+            )
+            return
+
+        # Берём настройки графика (из кэша или перечитываем с диска)
+        chart_settings = getattr(self, "chart_settings", None) or self.load_chart_settings()
+
+        # Преобразуем входные данные в словарь дата -> кол-во сообщений
+        from datetime import datetime as _dt, timedelta as _td
+
+        date_to_count = {}
+        for d_str, cnt in daily_counts:
+            try:
+                d = _dt.strptime(d_str, "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            date_to_count[d] = int(cnt)
+
+        if not date_to_count:
+            messagebox.showinfo(
+                "Нет данных",
+                "Не удалось подготовить данные для графика.",
+            )
+            return
+
+        # Строим полный диапазон дней от первого сообщения до последнего
+        first_day = min(date_to_count.keys())
+        last_day = max(date_to_count.keys())
+
+        all_dates = []
+        all_counts = []
+        current = first_day
+        while current <= last_day:
+            all_dates.append(current)
+            all_counts.append(date_to_count.get(current, 0))
+            current += _td(days=1)
+
+        # Готовим данные для столбчатого графика PyQtGraph:
+        # x — индекс дня в диапазоне, y — количество сообщений
+        x_values = list(range(len(all_dates)))
+        y_values = all_counts
+
+        try:
+            # Создаём/переиспользуем приложение Qt
+            app = QtWidgets.QApplication.instance()
+            if app is None:
+                app = QtWidgets.QApplication([])
+
+            # Создаём главное окно (QMainWindow) для графика
+            main_window = QtWidgets.QMainWindow()
+            main_window.setWindowTitle(f"График сообщений: {chat_title} ({chat_tg_id})")
+            
+            # Создаём центральный виджет с графиком
+            central_widget = pg.GraphicsLayoutWidget()
+            main_window.setCentralWidget(central_widget)
+            
+            # Устанавливаем размер окна на весь экран
+            screen = app.primaryScreen().geometry()
+            main_window.resize(screen.width(), screen.height())
+            
+            plot = central_widget.addPlot()
+            plot.setLabel("bottom", "Дата")
+            plot.setLabel("left", "Количество сообщений")
+
+            # Столбчатый график
+            bar_color = chart_settings.get("bar_color", "#1f77b4")
+            bar_item = pg.BarGraphItem(
+                x=x_values,
+                height=y_values,
+                width=0.8,
+                brush=bar_color,
+            )
+            plot.addItem(bar_item)
+
+            # Подписи по оси X: каждый день от первого до последнего сообщения
+            # Ограничиваем количество подписей для читаемости (показываем каждую N-ю дату)
+            num_ticks = min(20, len(x_values))  # Максимум 20 подписей
+            if num_ticks > 0 and len(x_values) > 1:
+                step = max(1, len(x_values) // num_ticks)
+                ticks = [(i, all_dates[i].strftime("%Y-%m-%d")) for i in range(0, len(x_values), step)]
+            else:
+                ticks = [(i, all_dates[i].strftime("%Y-%m-%d")) for i in x_values]
+            
+            axis = plot.getAxis("bottom")
+            axis.setTicks([ticks])
+            axis.setStyle(tickFont=QtGui.QFont("Sans Serif", 8))
+
+            # Сохраняем ссылку на окно, чтобы оно не удалилось сборщиком мусора
+            if not hasattr(self, '_chart_windows'):
+                self._chart_windows = []
+            self._chart_windows.append(main_window)
+
+            # Открываем окно в полноэкранном режиме
+            main_window.show()
+            main_window.showMaximized()
+            
+            # Принудительно поднимаем окно на передний план и даём ему фокус
+            main_window.setWindowState(main_window.windowState() & ~QtCore.Qt.WindowMinimized | QtCore.Qt.WindowActive)
+            main_window.raise_()
+            main_window.activateWindow()
+            main_window.setFocus()
+            
+            # Принудительно обрабатываем события, чтобы окно точно появилось на переднем плане
+            app.processEvents()
+            
+            # Запускаем обработку событий Qt в отдельном потоке
+            def run_qt_event_loop():
+                import time
+                while main_window.isVisible():
+                    app.processEvents()
+                    time.sleep(0.01)
+            
+            import threading
+            qt_thread = threading.Thread(target=run_qt_event_loop, daemon=True)
+            qt_thread.start()
+            
+            # Дополнительно поднимаем окно на передний план после небольшой задержки
+            def bring_to_front():
+                main_window.setWindowState(main_window.windowState() & ~QtCore.Qt.WindowMinimized | QtCore.Qt.WindowActive)
+                main_window.raise_()
+                main_window.activateWindow()
+                main_window.setFocus()
+                app.processEvents()
+            
+            self.after(100, bring_to_front)
+            self.after(300, bring_to_front)  # Дополнительная попытка через 300мс
+            
+        except Exception as e:
+            messagebox.showerror(
+                "Ошибка открытия графика",
+                f"Не удалось открыть график: {str(e)}",
+            )
 
 def main():
     """Точка входа в приложение."""

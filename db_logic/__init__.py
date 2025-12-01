@@ -13,7 +13,12 @@ from .database import (
     add_category_to_chat,
     remove_category_from_chat,
     get_available_categories_for_chat,
-    search_available_categories_for_chat
+    search_available_categories_for_chat,
+    get_last_message_id_for_chat,
+    append_message_stats,
+    replace_message_stats_for_chat,
+    has_message_stats_for_chat,
+    get_daily_message_counts,
 )
 
 __all__ = [
@@ -28,6 +33,11 @@ __all__ = [
     'add_category_to_chat',
     'remove_category_from_chat',
     'get_available_categories_for_chat',
-    'search_available_categories_for_chat'
+    'search_available_categories_for_chat',
+    'get_last_message_id_for_chat',
+    'append_message_stats',
+    'replace_message_stats_for_chat',
+    'has_message_stats_for_chat',
+    'get_daily_message_counts',
 ]
 
